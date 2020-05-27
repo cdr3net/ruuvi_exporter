@@ -1,4 +1,4 @@
-module github.com/milaboratory/cdr3net/ruuvi_exporter
+module github.com/milaboratory/ruuvi_exporter
 
 go 1.14
 
