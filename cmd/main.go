@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/go-ble/ble"
@@ -137,15 +140,23 @@ func main() {
 	}
 
 	dataChannel := make(chan RuuviPacket, 16)
+	scanStopped := make(chan struct{})
+
+	scanCtx, cancelScan := context.WithCancel(context.Background())
 
 	go func() {
-		log.Fatal(device.Scan(context.Background(), true, func(a ble.Advertisement) {
+		err := device.Scan(scanCtx, true, func(a ble.Advertisement) {
 			packet := TryParseRuuviPacketFromManufacturerData(a)
 			if packet != nil {
 				log.Println(packet)
 				dataChannel <- *packet
 			}
-		}))
+		})
+		if err != context.Canceled {
+			log.Fatalln(err)
+		}
+
+		close(scanStopped)
 	}()
 
 	go func() {
@@ -158,8 +169,25 @@ func main() {
 	recheckPeriod := 10 * time.Second
 	check := time.After(recheckPeriod)
 
+	signals := make(chan os.Signal)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+
 	for {
 		select {
+		case <-signals:
+			log.Println("Termination signal received")
+			cancelScan()
+			<-scanStopped
+			log.Println("Scan stopped")
+
+			err := device.Stop()
+			if err != nil {
+				log.Fatalln(err)
+			}
+			log.Println("Device closed")
+
+			os.Exit(0)
+
 		case <-check:
 			expPoint := time.Now().Add(-expTime)
 			for mac, data := range previousData {
@@ -199,4 +227,5 @@ func main() {
 			previousData[mac] = data
 		}
 	}
+
 }
