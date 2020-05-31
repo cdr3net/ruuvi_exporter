@@ -13,14 +13,19 @@ COPY cmd /build/cmd
 
 RUN CGO_ENABLED=0 go build -o ruuvi_exporter cmd/main.go
 
-FROM alpine:3.11
+FROM debian
 
-#RUN apk --update --no-cache add ca-certificates && \
-#    mkdir /ngs && \
-#    mkdir /state
+RUN apt-get update && apt-get install -y \
+  bluez \
+  lsof \
+  htop
+#  bluez-tools \
+#  libbluetooth-dev
 
 COPY --from=builder /build/ruuvi_exporter /opt/ruuvi_exporter
+COPY entrypoint.sh /entrypoint/entrypoint.sh
+RUN ["chmod", "+x", "/entrypoint/entrypoint.sh"]
 
 EXPOSE 10000
 
-ENTRYPOINT "/opt/ruuvi_exporter"
+ENTRYPOINT "/entrypoint/entrypoint.sh"
