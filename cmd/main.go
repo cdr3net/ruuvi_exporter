@@ -139,6 +139,16 @@ func main() {
 		log.Fatalln(err)
 	}
 
+	err = device.Stop()
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	device, err = dev.NewDevice("default")
+	if err != nil {
+		log.Fatalln(err)
+	}
+
 	dataChannel := make(chan RuuviPacket, 16)
 	scanStopped := make(chan struct{})
 
@@ -152,6 +162,7 @@ func main() {
 				dataChannel <- *packet
 			}
 		})
+
 		if err != context.Canceled {
 			log.Fatalln(err)
 		}
