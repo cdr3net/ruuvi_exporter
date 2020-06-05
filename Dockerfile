@@ -19,8 +19,6 @@ RUN apt-get update && apt-get install -y \
   bluez \
   lsof \
   htop
-#  bluez-tools \
-#  libbluetooth-dev
 
 COPY --from=builder /build/ruuvi_exporter /opt/ruuvi_exporter
 COPY entrypoint.sh /entrypoint/entrypoint.sh
