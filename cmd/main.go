@@ -12,6 +12,7 @@ import (
 
 	"github.com/godbus/dbus"
 	"github.com/muka/go-bluetooth/api"
+	"github.com/muka/go-bluetooth/bluez"
 	"github.com/muka/go-bluetooth/bluez/profile/adapter"
 	"github.com/muka/go-bluetooth/bluez/profile/device"
 	"github.com/prometheus/client_golang/prometheus"
@@ -116,26 +117,140 @@ func TryParseRuuviPacketFromManufacturerData(data map[uint16]interface{}) *Ruuvi
 	}
 }
 
+type gauges struct {
+	temperature        *prometheus.GaugeVec
+	humidity           *prometheus.GaugeVec
+	pressure           *prometheus.GaugeVec
+	accelerationX      *prometheus.GaugeVec
+	accelerationY      *prometheus.GaugeVec
+	accelerationZ      *prometheus.GaugeVec
+	powerVoltage       *prometheus.GaugeVec
+	movementCounter    *prometheus.CounterVec
+	measurementCounter *prometheus.HistogramVec
+}
+
+type previousCountersStruct struct {
+	previousMovement    uint8
+	previousMeasurement uint16
+	isInitialized       bool
+}
+
+func (g *gauges) setMetrics(label string, manufacturerData *RuuviPacket, previousCounters previousCountersStruct) {
+	labels := prometheus.Labels{"mac": label}
+	g.temperature.With(labels).Set(manufacturerData.GetTemperatureInCelsius())
+	g.humidity.With(labels).Set(manufacturerData.GetHumidity())
+	g.pressure.With(labels).Set(manufacturerData.GetPressure())
+	g.accelerationX.With(labels).Set(manufacturerData.GetAccelerationX())
+	g.accelerationY.With(labels).Set(manufacturerData.GetAccelerationY())
+	g.accelerationZ.With(labels).Set(manufacturerData.GetAccelerationZ())
+	g.powerVoltage.With(labels).Set(manufacturerData.GetPowerInfoVoltage())
+	if previousCounters.isInitialized {
+		g.movementCounter.With(labels).Add(float64(manufacturerData.MovementCounter - previousCounters.previousMovement))
+		g.measurementCounter.With(labels).Observe(float64(manufacturerData.MeasurementCounter - previousCounters.previousMeasurement))
+	}
+}
+
+func (g *gauges) removeMetrics(label string) {
+	labels := prometheus.Labels{"mac": label}
+	g.temperature.Delete(labels)
+	g.humidity.Delete(labels)
+	g.pressure.Delete(labels)
+	g.accelerationX.Delete(labels)
+	g.accelerationY.Delete(labels)
+	g.accelerationZ.Delete(labels)
+	g.powerVoltage.Delete(labels)
+	g.movementCounter.Delete(labels)
+	g.measurementCounter.Delete(labels)
+}
+
+var expTime = 2 * time.Minute
+
+func deviceHandler(adapter *adapter.Adapter1, path dbus.ObjectPath, gauges *gauges, cancelCh chan struct{}) {
+	mac := string(path)
+
+	dev, err := device.NewDevice1(path)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	properties, err := dev.WatchProperties()
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	previousCounters := previousCountersStruct{}
+	timeout := time.After(expTime)
+
+	terminate := func() {
+		log.Println("Terminating handler for ", mac)
+		gauges.removeMetrics(mac)
+		err := dev.UnwatchProperties(properties)
+		log.Println("Unwatch properties ", mac)
+
+		if err != nil {
+			log.Fatalln(err)
+		}
+		err = adapter.RemoveDevice(path)
+		if err != nil {
+			log.Fatalln(err)
+		}
+		log.Println("Device removed from adapter ", mac)
+	}
+
+	defer terminate()
+
+	for {
+		select {
+		case <-cancelCh:
+			log.Println("cancelCh received signal ", path)
+			return
+
+		case <-timeout:
+			log.Println("timeout received signal ", path)
+			return
+
+		case property := <-properties:
+			if property.Name == "ManufacturerData" {
+				data := dev.Properties.ManufacturerData
+				if manufacturerData := TryParseRuuviPacketFromManufacturerData(data); manufacturerData != nil {
+
+					log.Println(mac + manufacturerData.String())
+					gauges.setMetrics(mac, manufacturerData, previousCounters)
+
+					previousCounters = previousCountersStruct{
+						previousMovement:    manufacturerData.MovementCounter,
+						previousMeasurement: manufacturerData.MeasurementCounter,
+						isInitialized:       true,
+					}
+
+					timeout = time.After(expTime)
+				}
+			}
+		}
+	}
+}
+
 func main() {
 	log.Println("HiThere!")
 
-	signals := make(chan os.Signal)
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	cancelMap := make(map[dbus.ObjectPath]chan struct{})
 
+	gauges := gauges{
+		temperature:     prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "ruuvi_temperature_celsius"}, []string{"mac"}),
+		humidity:        prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "ruuvi_relative_humidity"}, []string{"mac"}),
+		pressure:        prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "ruuvi_pressure_pa"}, []string{"mac"}),
+		accelerationX:   prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "ruuvi_acceleration_x"}, []string{"mac"}),
+		accelerationY:   prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "ruuvi_acceleration_y"}, []string{"mac"}),
+		accelerationZ:   prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "ruuvi_acceleration_z"}, []string{"mac"}),
+		powerVoltage:    prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "ruuvi_battery_voltage"}, []string{"mac"}),
+		movementCounter: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "ruuvi_movement_count"}, []string{"mac"}),
+		measurementCounter: prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "ruuvi_measurement_counter",
+			Buckets: []float64{1, 2, 3, 5, 10}}, []string{"mac"}),
+	}
 	registry := prometheus.NewRegistry()
-	temperature := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "ruuvi_temperature_celsius"}, []string{"mac"})
-	humidity := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "ruuvi_relative_humidity"}, []string{"mac"})
-	pressure := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "ruuvi_pressure_pa"}, []string{"mac"})
-	accelerationX := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "ruuvi_acceleration_x"}, []string{"mac"})
-	accelerationY := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "ruuvi_acceleration_y"}, []string{"mac"})
-	accelerationZ := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "ruuvi_acceleration_z"}, []string{"mac"})
-	powerVoltage := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "ruuvi_battery_voltage"}, []string{"mac"})
-	rssi := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "ruuvi_rssi"}, []string{"mac"})
-	movementCounter := prometheus.NewCounterVec(prometheus.CounterOpts{Name: "ruuvi_movement_count"}, []string{"mac"})
-	measurementCounter := prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "ruuvi_measurement_counter",
-		Buckets: []float64{1, 2, 3, 5, 10}}, []string{"mac"})
 
-	registry.MustRegister(temperature, humidity, pressure, accelerationX, accelerationY, accelerationZ, powerVoltage, movementCounter, measurementCounter, rssi)
+	registry.MustRegister(gauges.temperature, gauges.humidity, gauges.pressure, gauges.accelerationX,
+		gauges.accelerationY, gauges.accelerationZ, gauges.powerVoltage, gauges.movementCounter, gauges.measurementCounter)
 
 	go func() {
 		http.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
@@ -147,209 +262,56 @@ func main() {
 		log.Println(err)
 	}
 
-	timeout, err := a.GetDiscoverableTimeout()
-	if err != nil {
-		log.Println(err)
-	}
-	log.Println("Timeout= ", timeout)
-
-	// Set timeout for discovery
-	err = a.SetDiscoverableTimeout(60)
+	discoverEvents, _, err := api.Discover(a, nil)
 	if err != nil {
 		log.Println(err)
 	}
 
-	discoverEvents, cancel, err := api.Discover(a, nil)
-	if err != nil {
-		log.Println(err)
-	}
+	signals := make(chan os.Signal)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 
-	removedMap := make(map[dbus.ObjectPath]chan struct{})
-
+outer:
 	for {
 		select {
-		case <-signals:
-			cancel()
-			log.Println("Scan stopped")
-			err := api.Exit()
-			if err != nil {
-				log.Fatalln(err)
+		case received := <-signals:
+			log.Println("Termination signal detected")
+			log.Println(received.String())
+			for dev := range cancelMap {
+				close(cancelMap[dev])
+				delete(cancelMap, dev)
 			}
-			log.Println("Device closed")
-			os.Exit(0)
+			//cancel()
+			log.Println("Terminated")
+			break outer
 
-		case event := <-discoverEvents:
+
+		case event, opened := <-discoverEvents:
+			if !opened {
+				log.Println("Event channel closed")
+				break outer
+			}
 
 			if event.Type == adapter.DeviceRemoved {
-				close(removedMap[event.Path])
-				delete(removedMap, event.Path)
-
+				log.Println("removed", event.Path)
 			} else if event.Type == adapter.DeviceAdded {
-
-				removeCh := make(chan struct{})
-				removedMap[event.Path] = removeCh
-
-				go func() {
-
-					dev, err := device.NewDevice1(event.Path)
-					if err != nil {
-						log.Fatalln(err)
-					}
-
-					properties, err := dev.WatchProperties()
-					if err != nil {
-						log.Fatalln(err)
-					}
-
-					for {
-						select {
-						case <-removeCh:
-							log.Println("removed")
-							err := dev.UnwatchProperties(properties)
-							if err != nil {
-								log.Fatalln(err)
-							}
-							return
-
-						case property := <-properties:
-							if property.Name == "ManufacturerData" {
-								data := dev.Properties.ManufacturerData
-								manufacturerData := TryParseRuuviPacketFromManufacturerData(data)
-								log.Println(manufacturerData)
-							}
-						}
-
-					}
-
-				}()
+				log.Println("deviceAdded", event.Path)
+				cancelCh := make(chan struct{})
+				cancelMap[event.Path] = cancelCh
+				go deviceHandler(a, event.Path, &gauges, cancelCh)
 			}
-
 		}
 	}
 
-	//for discovered := range discoverEvents {
-	//	fmt.Println(discovered)
-	//	dev, err := device.NewDevice1(discovered.Path)
-	//	if err != nil {
-	//		log.Println(err)
-	//	}
-	//	channel := dev.GetWatchPropertiesChannel()
-	//	go func() {
-	//		for data := range channel {
-	//			fmt.Println(data)
-	//		}
-	//	}()
-	//	dev.Close()
-	//}
-	//cancel()
-	//
-	//registry := prometheus.NewRegistry()
-	//temperature := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "ruuvi_temperature_celsius"}, []string{"mac"})
-	//humidity := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "ruuvi_relative_humidity"}, []string{"mac"})
-	//pressure := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "ruuvi_pressure_pa"}, []string{"mac"})
-	//accelerationX := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "ruuvi_acceleration_x"}, []string{"mac"})
-	//accelerationY := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "ruuvi_acceleration_y"}, []string{"mac"})
-	//accelerationZ := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "ruuvi_acceleration_z"}, []string{"mac"})
-	//powerVoltage := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "ruuvi_battery_voltage"}, []string{"mac"})
-	//rssi := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "ruuvi_rssi"}, []string{"mac"})
-	//movementCounter := prometheus.NewCounterVec(prometheus.CounterOpts{Name: "ruuvi_movement_count"}, []string{"mac"})
-	//measurementCounter := prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "ruuvi_measurement_counter",
-	//	Buckets: []float64{1, 2, 3, 5, 10}}, []string{"mac"})
-	//
-	//registry.MustRegister(temperature, humidity, pressure, accelerationX, accelerationY, accelerationZ, powerVoltage, movementCounter, measurementCounter, rssi)
-	//
-	//device, err := dev.NewDevice("default")
-	//if err != nil {
-	//	log.Fatalln(err)
-	//}
-	//
-	//dataChannel := make(chan RuuviPacket, 16)
-	//scanStopped := make(chan struct{})
-	//
-	//scanCtx, cancelScan := context.WithCancel(context.Background())
-	//
-	//go func() {
-	//	err := device.Scan(scanCtx, true, func(a ble.Advertisement) {
-	//		packet := TryParseRuuviPacketFromManufacturerData(a)
-	//		if packet != nil {
-	//			log.Println(packet)
-	//			dataChannel <- *packet
-	//		}
-	//	})
-	//	if err != context.Canceled {
-	//		log.Fatalln(err)
-	//	}
-	//
-	//	close(scanStopped)
-	//}()
-	//
-	//go func() {
-	//	http.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
-	//	log.Fatal(http.ListenAndServe(":10000", nil))
-	//}()
-	//
-	//previousData := make(map[string]RuuviPacket)
-	//expTime := 2 * time.Minute
-	//recheckPeriod := 10 * time.Second
-	//check := time.After(recheckPeriod)
-	//
-	//signals := make(chan os.Signal)
-	//signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
-	//
-	//for {
-	//	select {
-	//	case <-signals:
-	//		log.Println("Termination signal received")
-	//		cancelScan()
-	//		<-scanStopped
-	//		log.Println("Scan stopped")
-	//
-	//		err := device.Stop()
-	//		if err != nil {
-	//			log.Fatalln(err)
-	//		}
-	//		log.Println("Device closed")
-	//
-	//		os.Exit(0)
-	//
-	//	case <-check:
-	//		expPoint := time.Now().Add(-expTime)
-	//		for mac, data := range previousData {
-	//			if data.Timestamp.Before(expPoint) {
-	//				labels := prometheus.Labels{"mac": mac}
-	//				temperature.Delete(labels)
-	//				humidity.Delete(labels)
-	//				pressure.Delete(labels)
-	//				accelerationX.Delete(labels)
-	//				accelerationY.Delete(labels)
-	//				accelerationZ.Delete(labels)
-	//				powerVoltage.Delete(labels)
-	//				movementCounter.Delete(labels)
-	//				rssi.Delete(labels)
-	//				delete(previousData, mac)
-	//			}
-	//		}
-	//		check = time.After(recheckPeriod)
-	//
-	//	case data := <-dataChannel:
-	//		mac := data.Address.String()
-	//		previousValue, hasPreviousValue := previousData[mac]
-	//		labels := prometheus.Labels{"mac": mac}
-	//		temperature.With(labels).Set(data.GetTemperatureInCelsius())
-	//		humidity.With(labels).Set(data.GetHumidity())
-	//		pressure.With(labels).Set(data.GetPressure())
-	//		accelerationX.With(labels).Set(data.GetAccelerationX())
-	//		accelerationY.With(labels).Set(data.GetAccelerationY())
-	//		accelerationZ.With(labels).Set(data.GetAccelerationZ())
-	//		powerVoltage.With(labels).Set(data.GetPowerInfoVoltage())
-	//		rssi.With(labels).Set(float64(data.RSSI))
-	//		if hasPreviousValue {
-	//			movementCounter.With(labels).Add(float64(data.MovementCounter - previousValue.MovementCounter))
-	//			measurementCounter.With(labels).Observe(float64(data.MeasurementCounter - previousValue.MeasurementCounter))
-	//
-	//		}
-	//		previousData[mac] = data
-	//		}
-	//}
+	log.Println("outer stopped")
 
+	a.Close()
+	log.Println("Adapter close")
+
+	err = bluez.CloseConnections()
+	if err != nil {
+		log.Fatalln(err)
+	}
+	//err = api.Exit()
+	log.Println("API exit")
+	os.Exit(0)
 }
