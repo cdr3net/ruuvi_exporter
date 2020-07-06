@@ -24,7 +24,7 @@ type RuuviPacket struct {
 	Timestamp time.Time
 	Address   ble.Addr
 	RSSI      int
-	// Temperature in celsius / 200
+
 	Temperature        int16
 	Humidity           uint16
 	Pressure           uint16
