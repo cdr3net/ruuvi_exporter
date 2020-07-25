@@ -17,9 +17,6 @@
 #   list:
 #   - ubuntu:ubuntu
 
-# Enable password authentication with the SSH daemon
-# ssh_pwauth: true
-
 ## On first boot, use ssh-import-id to give the specific users SSH access to
 ## the default user
 #ssh_import_id:
@@ -27,13 +24,6 @@
 #- gh:my_github_username
 
 disable_root: true
-
-## Add users and groups to the system, and import keys with the ssh-import-id
-## utility
-#groups:
-#- robot: [robot]
-#- robotics: [robot]
-#- pi
 
 users:
   - name: pi
@@ -44,15 +34,12 @@ users:
     sudo: ALL=(ALL) NOPASSWD:ALL
 
 ## Update apt database and upgrade packages on first boot
-#package_update: true
-#package_upgrade: true
+package_update: true
+package_upgrade: true
 
 ## Install additional packages on first boot
 packages:
   - mc
-
-#- pastebinit
-#- [libpython2.7, 2.7.3-0ubuntu3.1]
 
 ## Write arbitrary files to the file-system (including binaries!)
 #write_files:

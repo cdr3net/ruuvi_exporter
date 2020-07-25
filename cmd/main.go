@@ -134,7 +134,20 @@ func main() {
 
 	registry.MustRegister(temperature, humidity, pressure, accelerationX, accelerationY, accelerationZ, powerVoltage, movementCounter, measurementCounter, rssi)
 
-	device, err := dev.NewDevice("default")
+	deviceName := "default"
+	if env := os.Getenv("BT_DEVICE"); env != "" {
+		deviceName = env
+	}
+
+	listenAddress := ":10000"
+	if env := os.Getenv("LISTEN_ADDRESS"); env != "" {
+		listenAddress = env
+	}
+
+	log.Println("Device: ", deviceName)
+	log.Println("Address: ", listenAddress)
+
+	device, err := dev.NewDevice(deviceName)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -161,7 +174,7 @@ func main() {
 
 	go func() {
 		http.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
-		log.Fatal(http.ListenAndServe(":10000", nil))
+		log.Fatal(http.ListenAndServe(listenAddress, nil))
 	}()
 
 	previousData := make(map[string]RuuviPacket)
@@ -227,5 +240,4 @@ func main() {
 			previousData[mac] = data
 		}
 	}
-
 }
