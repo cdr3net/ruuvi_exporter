@@ -187,6 +187,17 @@ func main() {
 
 	for {
 		select {
+		case <-scanStopped:
+			log.Println("Scan stopped unexpectidly")
+
+			err := device.Stop()
+			if err != nil {
+				log.Fatalln(err)
+			}
+			log.Println("Device closed")
+
+			os.Exit(0)
+
 		case <-signals:
 			log.Println("Termination signal received")
 			cancelScan()
