@@ -8,11 +8,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/go-ble/ble"
 	"github.com/go-ble/ble/examples/lib/dev"
+	"github.com/gorilla/mux"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -172,12 +175,54 @@ func main() {
 		close(scanStopped)
 	}()
 
+	recentSensorData := make(map[string]RuuviPacket)
+	var recentSensorDataMutex sync.RWMutex
+
+	valueEndpointHandlerFunc := func(w http.ResponseWriter, r *http.Request) {
+		vars := mux.Vars(r)
+		mac := vars["mac"]
+		metric := vars["metric"]
+
+		recentSensorDataMutex.RLock()
+		defer recentSensorDataMutex.RUnlock()
+
+		data, ok := recentSensorData[mac]
+
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		value := ""
+		switch metric {
+		case "temperature_celsius":
+			value = strconv.FormatFloat(data.GetTemperatureInCelsius(), 'f', 3, 64)
+		case "pressure_pa":
+			value = strconv.FormatFloat(data.GetPressure(), 'f', 3, 64)
+		case "relative_humidity":
+			value = strconv.FormatFloat(data.GetHumidity(), 'f', 3, 64)
+		case "battery_voltage":
+			value = strconv.FormatFloat(data.GetPowerInfoVoltage(), 'f', 3, 64)
+		default:
+			ok = false
+		}
+
+		if ok {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(value))
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}
+
 	go func() {
-		http.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
-		log.Fatal(http.ListenAndServe(listenAddress, nil))
+		r := mux.NewRouter()
+		r.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+		r.HandleFunc("/sensor/{mac}/{metric}", valueEndpointHandlerFunc)
+
+		log.Fatal(http.ListenAndServe(listenAddress, r))
 	}()
 
-	previousData := make(map[string]RuuviPacket)
 	expTime := 2 * time.Minute
 	recheckPeriod := 10 * time.Second
 	check := time.After(recheckPeriod)
@@ -214,7 +259,8 @@ func main() {
 
 		case <-check:
 			expPoint := time.Now().Add(-expTime)
-			for mac, data := range previousData {
+			recentSensorDataMutex.Lock()
+			for mac, data := range recentSensorData {
 				if data.Timestamp.Before(expPoint) {
 					labels := prometheus.Labels{"mac": mac}
 					temperature.Delete(labels)
@@ -226,14 +272,15 @@ func main() {
 					powerVoltage.Delete(labels)
 					movementCounter.Delete(labels)
 					rssi.Delete(labels)
-					delete(previousData, mac)
+					delete(recentSensorData, mac)
 				}
 			}
+			recentSensorDataMutex.Unlock()
 			check = time.After(recheckPeriod)
 
 		case data := <-dataChannel:
 			mac := data.Address.String()
-			previousValue, hasPreviousValue := previousData[mac]
+			previousValue, hasPreviousValue := recentSensorData[mac]
 			labels := prometheus.Labels{"mac": mac}
 			temperature.With(labels).Set(data.GetTemperatureInCelsius())
 			humidity.With(labels).Set(data.GetHumidity())
@@ -246,9 +293,10 @@ func main() {
 			if hasPreviousValue {
 				movementCounter.With(labels).Add(float64(data.MovementCounter - previousValue.MovementCounter))
 				measurementCounter.With(labels).Observe(float64(data.MeasurementCounter - previousValue.MeasurementCounter))
-
 			}
-			previousData[mac] = data
+			recentSensorDataMutex.Lock()
+			recentSensorData[mac] = data
+			recentSensorDataMutex.Unlock()
 		}
 	}
 }
